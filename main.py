@@ -206,7 +206,7 @@ def get_ai_analysis(address: str, balance: float, tx_count: int, failed: int,
                 "Content-Type": "application/json"
             },
             json={
-                "model": "llama3-8b-8192",
+                "model": "llama-3.1-8b-instant",
                 "messages": [
                     {"role": "user", "content": prompt}
                 ],
