@@ -15,34 +15,36 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # --- Config ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 ARBISCAN_API_KEY = os.getenv("ARBISCAN_API_KEY", "")
 ARBITRUM_RPC = "https://arb1.arbitrum.io/rpc"
 
 if not BOT_TOKEN:
     raise EnvironmentError("BOT_TOKEN environment variable is not set.")
+if not GROQ_API_KEY:
+    raise EnvironmentError("GROQ_API_KEY environment variable is not set.")
 
 WELCOME = (
     "Hey, welcome.\n\n"
-    "Send any Arbitrum wallet address and I will take a quick look at it.\n"
-    "Activity, balance, token holdings, and what it might say about the person behind it.\n\n"
-    "No noise. Just a clean read.\n\n"
-    "Commands:\n"
-    "/start - Show this message\n"
-    "/help - How to use this bot"
+    "I am ArbiAgent -- an onchain analyst living inside Arbitrum.\n\n"
+    "Drop any wallet address and I will read it for you. "
+    "Activity, balance, token history, wallet age, risk feel, and a real take on what is going on.\n\n"
+    "No fluff. Just signal.\n\n"
+    "/help to see how it works."
 )
 
 HELP = (
-    "How to use:\n\n"
-    "Just paste any Ethereum or Arbitrum wallet address (starts with 0x, 42 characters).\n\n"
-    "I will check:\n"
+    "How to use ArbiAgent:\n\n"
+    "Paste any Ethereum or Arbitrum wallet address (starts with 0x, 42 characters).\n\n"
+    "I will pull:\n"
     "- ETH balance\n"
-    "- Recent transactions\n"
-    "- Token holdings (ERC-20)\n"
-    "- First and last activity\n"
-    "- Wallet age\n"
-    "- Activity insight\n"
-    "- Overall score\n\n"
-    "Example:\n"
+    "- Recent transactions + failed tx count\n"
+    "- Token history (ERC-20 interactions)\n"
+    "- Wallet age and last activity\n"
+    "- An AI-generated read on the wallet\n\n"
+    "Then I give you my honest take -- what kind of wallet this is, "
+    "what the behavior suggests, and what to watch out for.\n\n"
+    "Example address:\n"
     "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
 )
 
@@ -88,7 +90,7 @@ def get_transactions(address: str, limit: int = 20) -> list:
         return []
 
 
-def get_token_holdings(address: str) -> list:
+def get_token_interactions(address: str) -> list:
     try:
         url = (
             "https://api.arbiscan.io/api"
@@ -108,10 +110,10 @@ def get_token_holdings(address: str) -> list:
                 name = tx.get("tokenName", "?")
                 if symbol not in seen:
                     seen[symbol] = name
-            return list(seen.items())[:5]
+            return list(seen.items())[:6]
         return []
     except Exception as e:
-        logger.error("Error fetching token holdings for %s: %s", address, e)
+        logger.error("Error fetching token interactions for %s: %s", address, e)
         return []
 
 
@@ -124,16 +126,13 @@ def get_wallet_age(txs: list) -> str:
         if ts == 0:
             return "unknown"
         dt = datetime.utcfromtimestamp(ts)
-        now = datetime.utcnow()
-        days = (now - dt).days
+        days = (datetime.utcnow() - dt).days
         if days < 30:
             return str(days) + " days"
         elif days < 365:
             return str(days // 30) + " months"
         else:
-            years = days // 365
-            months = (days % 365) // 30
-            return str(years) + "y " + str(months) + "m"
+            return str(days // 365) + "y " + str((days % 365) // 30) + "m"
     except Exception:
         return "unknown"
 
@@ -146,9 +145,7 @@ def get_last_active(txs: list) -> str:
         ts = int(latest.get("timeStamp", 0))
         if ts == 0:
             return "unknown"
-        dt = datetime.utcfromtimestamp(ts)
-        now = datetime.utcnow()
-        days = (now - dt).days
+        days = (datetime.utcnow() - datetime.utcfromtimestamp(ts)).days
         if days == 0:
             return "today"
         elif days == 1:
@@ -167,41 +164,6 @@ def count_failed_txs(txs: list) -> int:
     return sum(1 for tx in txs if tx.get("isError") == "1")
 
 
-# --- Analysis ---
-
-def generate_insight(tx_count: int, balance: float) -> str:
-    if tx_count > 20:
-        note = (
-            "This wallet is very active on-chain. "
-            "Frequent interactions usually point to someone deeply engaged in DeFi or trading."
-        )
-    elif tx_count > 5:
-        note = (
-            "This wallet has a steady level of activity. "
-            "Not aggressive, but clearly not idle either."
-        )
-    else:
-        note = (
-            "This wallet seems relatively quiet. "
-            "It may be holding assets rather than actively using them."
-        )
-
-    if balance > 1:
-        balance_note = (
-            "It holds a noticeable ETH balance, "
-            "which can suggest confidence or longer-term positioning."
-        )
-    elif balance > 0:
-        balance_note = (
-            "The balance is small, "
-            "so activity here may be more experimental than strategic."
-        )
-    else:
-        balance_note = "The wallet is currently empty on ETH."
-
-    return note + "\n\n" + balance_note
-
-
 def score_wallet(tx_count: int, balance: float, failed: int, age: str) -> float:
     balance_score = min(balance * 0.5, 3.0)
     tx_score = min(tx_count * 0.4, 5.0)
@@ -210,14 +172,55 @@ def score_wallet(tx_count: int, balance: float, failed: int, age: str) -> float:
     return min(10.0, round(tx_score + balance_score + age_bonus - penalty, 1))
 
 
-def get_risk_label(tx_count: int, balance: float, failed: int) -> str:
-    if failed > 3:
-        return "elevated (many failed txs)"
-    if tx_count > 10 and balance < 0.1:
-        return "moderate (high activity, low balance)"
-    if tx_count == 0:
-        return "low (no activity)"
-    return "normal"
+# --- AI analysis via Groq (free) ---
+
+def get_ai_analysis(address: str, balance: float, tx_count: int, failed: int,
+                    age: str, last_active: str, tokens: list, score: float) -> str:
+    try:
+        token_str = ", ".join([s for s, _ in tokens]) if tokens else "none detected"
+
+        prompt = (
+            "You are ArbiAgent, a sharp and lively onchain analyst. "
+            "You analyze Arbitrum wallets and give real, human-sounding takes. "
+            "You are direct, a little informal, and genuinely insightful. "
+            "Never sound like a robot. Never use bullet points. "
+            "Write 3-4 sentences in flowing prose like a real analyst talking to someone.\n\n"
+            "Wallet data:\n"
+            "Address: " + address[:6] + "..." + address[-4:] + "\n"
+            "ETH Balance: " + str(round(balance, 4)) + " ETH\n"
+            "Recent transactions: " + str(tx_count) + "\n"
+            "Failed transactions: " + str(failed) + "\n"
+            "Wallet age: " + age + "\n"
+            "Last active: " + last_active + "\n"
+            "Token interactions: " + token_str + "\n"
+            "Score: " + str(score) + "/10\n\n"
+            "Give your analyst take on this wallet. What type of wallet is this? "
+            "What does the behavior suggest? What should someone watch out for or note? "
+            "Keep it punchy, real, and interesting."
+        )
+
+        res = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={
+                "Authorization": "Bearer " + GROQ_API_KEY,
+                "Content-Type": "application/json"
+            },
+            json={
+                "model": "llama3-8b-8192",
+                "messages": [
+                    {"role": "user", "content": prompt}
+                ],
+                "max_tokens": 300,
+                "temperature": 0.8
+            },
+            timeout=20
+        )
+        res.raise_for_status()
+        return res.json()["choices"][0]["message"]["content"].strip()
+
+    except Exception as e:
+        logger.error("Error calling Groq API: %s", e)
+        return "AI analysis unavailable right now -- but the data above tells a clear story."
 
 
 # --- Handlers ---
@@ -237,7 +240,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not address.startswith("0x") or len(address) != 42:
         await update.message.reply_text(
             "That does not look like a valid wallet address.\n"
-            "Send a proper 0x address (42 characters total)."
+            "Send a 0x address that is 42 characters long."
         )
         return
 
@@ -248,54 +251,53 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
 
-    await update.message.reply_text("Checking that wallet... \U0001f50d")
+    await update.message.reply_text("On it... pulling the data now \U0001f50d")
 
     try:
         balance = get_eth_balance(address)
         txs = get_transactions(address, limit=20)
-        tokens = get_token_holdings(address)
+        tokens = get_token_interactions(address)
         tx_count = len(txs)
         failed = count_failed_txs(txs)
         age = get_wallet_age(txs)
         last_active = get_last_active(txs)
-        insight = generate_insight(tx_count, balance)
         score = score_wallet(tx_count, balance, failed, age)
-        risk = get_risk_label(tx_count, balance, failed)
 
-        # Recent tx lines
         if txs:
             tx_lines = ""
             for tx in txs[:3]:
                 tx_hash = tx.get("hash", "")
                 short = tx_hash[:10] + "..." if tx_hash else "unknown"
                 status = "failed" if tx.get("isError") == "1" else "ok"
-                tx_lines += "- " + short + " [" + status + "]\n"
+                tx_lines += "  " + short + " [" + status + "]\n"
         else:
-            tx_lines = "- no transactions found\n"
+            tx_lines = "  no transactions found\n"
 
-        # Token lines
         if tokens:
             token_lines = ""
             for symbol, name in tokens:
-                token_lines += "- " + symbol + " (" + name + ")\n"
+                token_lines += "  " + symbol + " -- " + name + "\n"
         else:
-            token_lines = "- none detected\n"
+            token_lines = "  none detected\n"
+
+        ai_take = get_ai_analysis(
+            address, balance, tx_count, failed, age, last_active, tokens, score
+        )
 
         response = (
-            "Wallet Analysis\n"
-            "--------------------\n\n"
+            "Wallet Report\n"
+            "========================\n\n"
             "Address: " + address[:6] + "..." + address[-4:] + "\n"
             "Balance: " + str(round(balance, 4)) + " ETH\n"
-            "Transactions: " + str(tx_count) + " recent\n"
-            "Failed txs: " + str(failed) + "\n"
             "Wallet age: " + age + "\n"
-            "Last active: " + last_active + "\n\n"
-            "Token Activity:\n" + token_lines + "\n"
-            "Recent Transactions:\n" + tx_lines + "\n"
-            "Insight:\n" + insight + "\n\n"
-            "Risk level: " + risk + "\n"
+            "Last active: " + last_active + "\n"
+            "Transactions: " + str(tx_count) + " recent\n"
+            "Failed: " + str(failed) + "\n"
             "Score: " + str(score) + " / 10\n\n"
-            "Send another address to keep going \U0001f44d"
+            "Token History:\n" + token_lines + "\n"
+            "Recent Transactions:\n" + tx_lines + "\n"
+            "My Take:\n" + ai_take + "\n\n"
+            "Drop another address whenever you are ready."
         )
 
         await update.message.reply_text(response)
@@ -303,7 +305,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     except Exception as e:
         logger.error("Unhandled error in handle_message for %s: %s", address, e)
         await update.message.reply_text(
-            "Something went wrong while checking that wallet. Try again in a bit."
+            "Something went wrong pulling that wallet. Try again in a moment."
         )
 
 
