@@ -15,7 +15,7 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # --- Config ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 ARBISCAN_API_KEY = os.getenv("ARBISCAN_API_KEY", "")
 ETHERSCAN_API_KEY = os.getenv("ETHERSCAN_API_KEY", "")
 
@@ -24,8 +24,8 @@ MAINNET_RPC = "https://eth.llamarpc.com"
 
 if not BOT_TOKEN:
     raise EnvironmentError("BOT_TOKEN environment variable is not set.")
-if not GROQ_API_KEY:
-    raise EnvironmentError("GROQ_API_KEY environment variable is not set.")
+if not OPENROUTER_API_KEY:
+    raise EnvironmentError("OPENROUTER_API_KEY environment variable is not set.")
 
 WELCOME = (
     "Hey, welcome.\n\n"
@@ -195,7 +195,8 @@ def score_wallet(tx_count: int, balance: float, failed: int, age: str) -> float:
     return min(10.0, round(t + b + a - p, 1))
 
 
-# --- AI via Groq ---
+
+# --- AI via OpenRouter (Gemini 2.0 Flash) ---
 
 def get_ai_analysis(address: str, arb_balance: float, eth_balance: float,
                     arb_txs: list, eth_txs: list, tokens: list,
@@ -205,9 +206,8 @@ def get_ai_analysis(address: str, arb_balance: float, eth_balance: float,
         failed = count_failed(arb_txs) + count_failed(eth_txs)
         token_str = ", ".join([s for s, _ in tokens]) if tokens else "none"
 
-        # Pull a few real tx details to give AI actual context
         sample_txs = ""
-        for tx in (arb_txs + eth_txs)[:4]:
+        for tx in (arb_txs + eth_txs)[:5]:
             val = round(int(tx.get("value", "0")) / 1e18, 4)
             ts = int(tx.get("timeStamp", 0))
             date = datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d") if ts else "unknown"
@@ -217,49 +217,59 @@ def get_ai_analysis(address: str, arb_balance: float, eth_balance: float,
         if not sample_txs:
             sample_txs = "  no transaction detail available\n"
 
-        prompt = (
-            "You are ArbiAgent, a brutally sharp onchain analyst. "
-            "You read wallets like a detective reads a crime scene. "
-            "You are direct, specific, a little edgy, and never generic. "
-            "You ONLY talk about what the data actually shows. "
-            "No filler. No 'it could be'. If the data is thin, say what that actually means. "
-            "Write exactly 3 punchy sentences. No bullet points. No greetings.\n\n"
-            "Here is the real data:\n"
+        system_prompt = (
+            "You are ArbiAgent -- a sharp, no-nonsense onchain analyst. "
+            "You read wallets the way a detective reads a crime scene. "
+            "You speak in 3 short punchy sentences. "
+            "You are specific, direct, and a little edgy. "
+            "You NEVER say generic things like 'this wallet could be...' or 'it seems like...'. "
+            "You state what the data shows as fact. "
+            "If the wallet is empty or inactive, tell the user exactly what that signals -- "
+            "cold storage, abandoned wallet, fresh address, dormant holder -- pick one based on the data. "
+            "No bullet points. No greetings. No filler. Just the read."
+        )
+
+        user_prompt = (
+            "Wallet data:\n"
             "Address: " + address[:6] + "..." + address[-4:] + "\n"
             "Arbitrum ETH: " + str(round(arb_balance, 4)) + "\n"
             "Mainnet ETH: " + str(round(eth_balance, 4)) + "\n"
-            "Total transactions: " + str(total_txs) + "\n"
-            "Failed transactions: " + str(failed) + "\n"
+            "Total txs: " + str(total_txs) + "\n"
+            "Failed txs: " + str(failed) + "\n"
             "Wallet age: " + age + "\n"
             "Last active: " + last_active + "\n"
             "Tokens touched: " + token_str + "\n"
             "Score: " + str(score) + "/10\n\n"
-            "Recent transaction samples:\n" + sample_txs + "\n"
-            "Now give your take. Be specific to THIS data. "
-            "What does this wallet actually tell you? What kind of person or entity is behind it? "
-            "What stands out, and what should someone pay attention to?"
+            "Recent txs:\n" + sample_txs + "\n"
+            "Give me your 3-sentence analyst read on this wallet right now."
         )
 
         res = requests.post(
-            "https://api.groq.com/openai/v1/chat/completions",
+            "https://openrouter.ai/api/v1/chat/completions",
             headers={
-                "Authorization": "Bearer " + GROQ_API_KEY,
-                "Content-Type": "application/json"
+                "Authorization": "Bearer " + OPENROUTER_API_KEY,
+                "Content-Type": "application/json",
+                "HTTP-Referer": "https://arbiagent.bot",
+                "X-Title": "ArbiAgent"
             },
             json={
-                "model": "llama-3.1-8b-instant",
-                "messages": [{"role": "user", "content": prompt}],
+                "model": "google/gemini-2.0-flash-exp:free",
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
                 "max_tokens": 250,
                 "temperature": 0.85
             },
-            timeout=20
+            timeout=25
         )
         res.raise_for_status()
         return res.json()["choices"][0]["message"]["content"].strip()
 
     except Exception as e:
-        logger.error("Groq API error: %s", e)
+        logger.error("OpenRouter API error: %s", e)
         return "AI analysis offline right now -- read the numbers above, they speak for themselves."
+
 
 
 # --- Telegram handlers ---
